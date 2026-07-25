@@ -1,0 +1,19 @@
+[project]
+name = "dbchatbot-backend"
+version = "0.1.0"
+description = "Natural-language Oracle DB chatbot backend (FastAPI + Anthropic)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "oracledb==4.0.2",
+    "anthropic==0.120.0",
+    "python-dotenv==1.0.1",
+    "pydantic==2.10.4",
+]
+
+[tool.uv]
+# This is an application (just scripts: main.py / db.py / llm.py), not an
+# installable library, so uv should not try to build/install the project
+# itself — only its dependencies.
+package = false
