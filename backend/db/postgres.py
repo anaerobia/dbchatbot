@@ -83,12 +83,32 @@ class PostgresDatabase(Database):
             return columns, rows
 
     def _fetch_columns(self) -> list[tuple[str, str, str]]:
-        """Read table/column metadata from ``information_schema``."""
+        """Read table/view column metadata from ``pg_catalog``.
+
+        Uses ``pg_catalog`` rather than ``information_schema`` so that:
+
+        * partitions (e.g. ``payment_p2022_01``) are skipped -- only the
+          partitioned parent is listed, which is what queries should target;
+        * enum/domain/array types show their real names (``mpaa_rating``,
+          ``text[]``) instead of ``USER-DEFINED``/``ARRAY``;
+        * materialized views are included;
+        * only relations the user may ``SELECT`` from are listed;
+        * names that need quoting (e.g. a ``"zip code"`` column) are quoted.
+        """
         query = """
-            SELECT table_schema || '.' || table_name, column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema = ANY(%s)
-            ORDER BY table_schema, table_name, ordinal_position
+            SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                   quote_ident(a.attname),
+                   format_type(a.atttypid, a.atttypmod)
+            FROM pg_catalog.pg_attribute a
+            JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY(%s)
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND NOT c.relispartition
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND has_table_privilege(c.oid, 'SELECT')
+            ORDER BY n.nspname, c.relname, a.attnum
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(query, (self._schemas,))
