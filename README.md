@@ -1,12 +1,16 @@
-# Oracle DB Chatbot
+# DB Chatbot
 
-Ask questions about your Oracle database in plain English. A Python (FastAPI)
-backend sends the question to the Anthropic API to generate an Oracle `SELECT`
-query, executes it read-only, and sends the results back to Claude to produce a
+Ask questions about your databases in plain English. Several databases can be
+configured — any number of Oracle instances and PostgreSQL databases — and
+you pick one from a dropdown in the UI. A Python (FastAPI) backend sends the
+question to the Anthropic API to generate SQL in that database's dialect,
+executes it read-only, and sends the results back to Claude to produce a
 natural-language answer. A React (Vite) frontend provides the chat UI.
 
 ```
 NL question ──▶ Claude (generate SQL) ──▶ read-only execute ──▶ Claude (summarize) ──▶ answer
+                         │
+                         └─ write request ──▶ SQL shown with a copy button (NOT executed)
 ```
 
 **Example:**
@@ -15,6 +19,14 @@ NL question ──▶ Claude (generate SQL) ──▶ read-only execute ──�
 
 ## Features
 
+- **Multiple databases** — Oracle (by SID or service name) and PostgreSQL,
+  configured in `backend/databases.json`. Each request is dispatched to the
+  selected database through a common `Database` interface (`backend/db/`), and
+  the SQL is generated in that database's dialect.
+- **SQL for changes, never executed** — ask for an insert/update/delete, a new
+  table, a grant, etc. and the bot writes the statement(s) for you, with a
+  **Copy SQL** button and a warning that the chatbot will not run it. Copy it
+  and execute it yourself with an account that has write access.
 - **Natural-language → SQL → answer** with the generated SQL and result rows
   shown for transparency ("Show SQL & data").
 - **Conversational memory** — follow-up questions resolve references from prior
@@ -31,18 +43,41 @@ NL question ──▶ Claude (generate SQL) ──▶ read-only execute ──�
 ## Stack
 
 - **Backend:** FastAPI, [`oracledb`](https://python-oracledb.readthedocs.io/) (thin
-  mode — no Oracle client install needed), `anthropic` SDK (`claude-opus-4-8`);
+  mode — no Oracle client install needed),
+  [`psycopg`](https://www.psycopg.org/psycopg3/) 3 for PostgreSQL, `anthropic` SDK (`claude-opus-4-8`);
   deps managed by [`uv`](https://docs.astral.sh/uv/) (`pyproject.toml` + `uv.lock`).
 - **Frontend:** React 18 + Vite, `react-markdown` for answer rendering.
 
+## Architecture: the database layer
+
+```
+backend/db/
+  base.py      Database ABC: run_select(), get_schema_description(), health_check()
+  oracle.py    OracleDatabase   (oracledb, SET TRANSACTION READ ONLY)
+  postgres.py  PostgresDatabase (psycopg, read-only session + statement_timeout)
+  guard.py     dialect-independent read-only check (assert_read_only / is_read_only)
+  registry.py  loads databases.json, get_database(name) dispatches by name
+```
+
+To add another engine, subclass `Database` (set `kind`, `dialect`,
+`dialect_rules`, implement `_execute_read_only` and `_fetch_columns`) and
+register it in `BACKENDS` in `registry.py`.
+
 ## Safety: read-only by design
 
-Two layers protect the database:
+The chatbot **only ever executes single read-only queries**. When you ask for a
+change, it generates the SQL and returns it for you to copy — with a warning
+that it was not executed. Three layers make sure nothing else runs:
 
-1. **Application guard** — `backend/db.py` refuses anything that is not a single
-   `SELECT`/`WITH` statement (no `INSERT/UPDATE/DELETE/DDL`, no statement
-   chaining), and issues `SET TRANSACTION READ ONLY` per query.
-2. **Dedicated read-only DB user (recommended).** The guard is defense in depth;
+1. **Application guard** — `backend/db/guard.py` treats anything that is not a
+   single `SELECT`/`WITH` statement (DML, DDL, statement chaining, Postgres
+   data-modifying CTEs, `SELECT ... INTO`, `FOR UPDATE`) as a write. Writes are
+   returned to the user, never executed — even if the model mislabels one as a
+   read.
+2. **Read-only sessions** — Oracle queries run after `SET TRANSACTION READ ONLY`;
+   Postgres connections use `default_transaction_read_only=on`, a read-only
+   transaction, and a `statement_timeout`.
+3. **Dedicated read-only DB user (recommended).** The guard is defense in depth;
    the real boundary should be a database account that *cannot* write. Ask your
    DBA to create one:
 
@@ -55,10 +90,19 @@ Two layers protect the database:
    -- ...repeat per table, or use a role.
    ```
 
-   Then point `ORACLE_USER`/`ORACLE_PASSWORD` at `chatbot_ro`. The schema
-   introspection in `db.py` reads `USER_TAB_COLUMNS`; if the read-only user owns
-   no tables, grant `SELECT` and adjust the introspection query to
-   `ALL_TAB_COLUMNS` filtered to the owning schema.
+   Then use `chatbot_ro` in the database's config entry. Oracle schema
+   introspection reads `USER_TAB_COLUMNS`; if the read-only user owns no
+   tables, set `"schemas": ["OWNER_SCHEMA"]` on the entry to read
+   `ALL_TAB_COLUMNS` for those owners instead.
+
+   For PostgreSQL:
+
+   ```sql
+   CREATE ROLE chatbot_ro LOGIN PASSWORD '<strong-password>';
+   GRANT CONNECT ON DATABASE analytics TO chatbot_ro;
+   GRANT USAGE ON SCHEMA public TO chatbot_ro;
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO chatbot_ro;
+   ```
 
 ## First-time setup
 
@@ -85,9 +129,32 @@ npm install
 Edit `backend/.env`:
 - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/ (or run `ant auth
   login` and leave it unset).
-- Set the Oracle connection values (`ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SID`,
-  `ORACLE_USER`, `ORACLE_PASSWORD`) for your database — ideally the read-only
-  account above.
+- The database passwords referenced by `password_env` in `databases.json`.
+
+### Configure databases
+
+```bash
+cd backend
+cp databases.example.json databases.json   # gitignored
+```
+
+Each entry needs a unique `name` and a `type` (`oracle` or `postgres`);
+`default` picks the one selected when the UI loads, and `label` is the name
+shown in the dropdown.
+
+| type       | settings                                                                                      |
+|------------|-----------------------------------------------------------------------------------------------|
+| `oracle`   | `host`, `port` (1521), `sid` **or** `service_name`, `user`, password, optional `schemas` (owners) |
+| `postgres` | `host`, `port` (5432), `dbname`, `user`, password, optional `schemas` (default `["public"]`), `sslmode`, `statement_timeout_ms` (60000) |
+
+Give the password as `"password_env": "VAR_NAME"` (read from `.env`/the
+environment — recommended) or inline as `"password"`. Set `DATABASES_CONFIG`
+to use a different file path.
+
+**Backward compatible:** if `databases.json` doesn't exist, the old
+`ORACLE_HOST` / `ORACLE_PORT` / `ORACLE_SID` / `ORACLE_USER` /
+`ORACLE_PASSWORD` variables in `.env` still define a single database named
+`oracle`.
 
 ## Running
 
@@ -115,16 +182,22 @@ cd frontend && npm run dev
 
 The dev server proxies `/api` to the backend on port 8000, so no CORS config is
 needed for local use. Check connectivity:
-`curl http://localhost:8000/api/health` → `{"status":"ok"}`.
+`curl http://localhost:8000/api/health` →
+`{"status":"ok","databases":{"oracle_main":"ok",...}}`.
 
 ## API
 
-- `POST /api/ask` — request `{ "question": "...", "history": [{ "question": "...",
-  "sql": "..." }] }` (history optional, for follow-up context) → response
-  `{ answer, sql, explanation, columns, rows, row_count, chart }`, where `chart`
-  is `null` or `{ type: "pie"|"bar"|"line", title, data: [{ label, value }] }`.
-- `GET /api/health` — liveness + DB connectivity.
-- `GET /api/schema` — the schema text the LLM is given (debugging).
+- `GET /api/databases` — `{ default, databases: [{ name, label, type, dialect }] }`.
+- `POST /api/ask` — request `{ "question": "...", "database": "analytics",
+  "history": [{ "question": "...", "sql": "..." }] }` (`database` optional —
+  defaults to the configured default; history optional, for follow-up context)
+  → response `{ answer, sql, explanation, database, executed, warning, columns,
+  rows, row_count, chart }`. `executed` is `false` (with a `warning`, and no
+  rows) when the SQL would modify the database. `chart` is `null` or
+  `{ type: "pie"|"bar"|"line", title, data: [{ label, value }] }`.
+- `GET /api/health[?database=name]` — liveness + connectivity of every
+  configured database (`status: "ok"|"degraded"`), or just the named one.
+- `GET /api/schema[?database=name]` — the schema text the LLM is given (debugging).
 
 ## Notes
 
