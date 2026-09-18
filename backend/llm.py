@@ -2,9 +2,11 @@
 
 Two steps:
 
-1. :func:`generate_sql` — turn a natural-language question into a single
-   read-only Oracle SQL query, using structured outputs so we get clean SQL
-   back with no prose to strip.
+1. :func:`generate_sql` — turn a natural-language question into SQL for the
+   selected database's dialect, using structured outputs so we get clean SQL
+   back with no prose to strip. Questions that ask to *change* the database
+   produce a ``statement_type: "write"`` result, which the app shows to the
+   user to copy but never executes.
 2. :func:`summarize_answer` — turn the query + result rows into a
    natural-language answer.
 
@@ -30,13 +32,29 @@ def _model() -> str:
 _SQL_SCHEMA = {
     "type": "object",
     "properties": {
+        "statement_type": {
+            "type": "string",
+            "enum": ["read", "write"],
+            "description": (
+                "'read' for a single SELECT/WITH query that answers a question. "
+                "'write' if the user asked to change data or structure "
+                "(INSERT/UPDATE/DELETE/MERGE/DDL/grants/...)."
+            ),
+        },
         "sql": {
             "type": "string",
-            "description": "A single read-only Oracle SELECT query answering the question.",
+            "description": (
+                "For 'read': one SELECT/WITH query, no trailing semicolon. For "
+                "'write': the complete, ready-to-run statement(s), each ending "
+                "with a semicolon."
+            ),
         },
         "explanation": {
             "type": "string",
-            "description": "One short sentence explaining what the query does.",
+            "description": (
+                "One short sentence explaining what the query does. For "
+                "'write', say what it will change and note any risks."
+            ),
         },
         "chart": {
             "type": "object",
@@ -50,7 +68,7 @@ _SQL_SCHEMA = {
                 "title": {"type": "string", "description": "Short chart title."},
                 "label_column": {
                     "type": "string",
-                    "description": "Result column name (as it appears in SELECT output, usually UPPERCASE) used for category labels / x-axis. Empty if type is none.",
+                    "description": "Result column name (exactly as it appears in the SELECT output) used for category labels / x-axis. Empty if type is none.",
                 },
                 "value_column": {
                     "type": "string",
@@ -61,7 +79,7 @@ _SQL_SCHEMA = {
             "additionalProperties": False,
         },
     },
-    "required": ["sql", "explanation", "chart"],
+    "required": ["statement_type", "sql", "explanation", "chart"],
     "additionalProperties": False,
 }
 
@@ -69,16 +87,23 @@ _SQL_SCHEMA = {
 # Static instructions — kept byte-identical across requests so they form part
 # of the stable cached prefix (any change here invalidates the cache).
 _SQL_INSTRUCTIONS = (
-    "You are an expert Oracle SQL analyst. Given a database schema and a "
-    "user's question, produce a single read-only Oracle SQL SELECT query "
-    "that answers it.\n\n"
+    "You are an expert SQL analyst. Given a database's SQL dialect, its "
+    "schema, and a user's request, produce SQL for that database.\n\n"
     "Rules:\n"
-    "- Output SELECT queries only. Never write INSERT/UPDATE/DELETE/DDL.\n"
-    "- Use only tables and columns that appear in the schema.\n"
-    "- Oracle SQL dialect. Do NOT end the statement with a semicolon.\n"
-    "- To limit rows use `FETCH FIRST n ROWS ONLY`.\n"
+    "- Write SQL in the dialect named in the database section below and "
+    "follow its dialect rules.\n"
+    "- If the user asks a question about the data, set statement_type to "
+    "'read' and write a single SELECT (or WITH ... SELECT) query.\n"
+    "- If the user asks to change the database (insert/update/delete rows, "
+    "create/alter/drop objects, grant privileges, etc.), set statement_type "
+    "to 'write' and write the complete statement(s) the user can copy and "
+    "run themselves, each terminated with a semicolon. The app will NOT "
+    "execute it. Never mix read and write statements in one answer, and never "
+    "hide a write inside a SELECT.\n"
+    "- Use only tables and columns that appear in the schema (a write may "
+    "create new objects the user asked for).\n"
     "- Prefer COUNT/aggregate queries when the user asks 'how many'.\n"
-    "- Identifiers are case-insensitive unless quoted; match the schema.\n"
+    "- Match identifier spelling and case to the schema.\n"
     "- The conversation may include prior turns. If the new question omits "
     "the table (e.g. 'how many distinct collections?', 'and its columns?'), "
     "infer it from the most recently referenced table in the conversation. "
@@ -89,19 +114,30 @@ _SQL_INSTRUCTIONS = (
     "('pie', 'bar', or 'line') and write SQL returning EXACTLY two columns: a "
     "category/label column and a numeric value column (use GROUP BY with "
     "COUNT/SUM). Set label_column and value_column to those output column names "
-    "(UPPERCASE unless you quoted them). Otherwise set chart.type to 'none' and "
-    "leave label_column/value_column empty."
+    "(exactly as the database will report them). Otherwise, and always for "
+    "'write', set chart.type to 'none' and leave label_column/value_column "
+    "empty."
 )
 
 
 def generate_sql(
     question: str,
     schema_description: str,
+    dialect_context: str,
     history: list[dict] | None = None,
+    failed_attempt: dict | None = None,
 ) -> dict:
-    """Generate a read-only Oracle SQL query for ``question``.
+    """Generate SQL for ``question`` in the target database's dialect.
 
-    Returns a dict with ``sql`` and ``explanation`` keys.
+    ``dialect_context`` names the dialect and server version and lists the
+    dialect's rules (see :meth:`db.base.Database.dialect_context`).
+
+    ``failed_attempt`` (``{"sql": str, "error": str}``) is a previous answer
+    to this same question that the database rejected; the model is shown the
+    error and asked for a corrected query.
+
+    Returns a dict with ``statement_type`` (``"read"``/``"write"``), ``sql``,
+    ``explanation`` and ``chart`` keys.
 
     ``history`` is an optional list of prior turns, each ``{"question": str,
     "sql": str}``, oldest first. It is replayed as alternating user/assistant
@@ -109,8 +145,9 @@ def generate_sql(
     table", "and its columns") against the most recently used table.
 
     The system prompt is split into two blocks: the static instructions and the
-    (large, stable) schema. A ``cache_control`` breakpoint on the schema block
-    caches the whole system prefix, so repeated questions only pay full price
+    (large, per-database but stable) dialect + schema block. A
+    ``cache_control`` breakpoint on the schema block caches the whole system
+    prefix, so repeated questions only pay full price
     for the volatile conversation. The schema is well above the 4096-token
     minimum cacheable prefix for Opus-tier models.
     """
@@ -118,7 +155,10 @@ def generate_sql(
         {"type": "text", "text": _SQL_INSTRUCTIONS},
         {
             "type": "text",
-            "text": f"Schema (table(column type, ...)):\n{schema_description}",
+            "text": (
+                f"{dialect_context}\n\n"
+                f"Schema (table(column type, ...)):\n{schema_description}"
+            ),
             "cache_control": {"type": "ephemeral"},
         },
     ]
@@ -130,6 +170,17 @@ def generate_sql(
         # model can see which table/columns the conversation is about.
         messages.append({"role": "assistant", "content": turn["sql"]})
     messages.append({"role": "user", "content": question})
+    if failed_attempt:
+        messages.append({"role": "assistant", "content": failed_attempt["sql"]})
+        messages.append({
+            "role": "user",
+            "content": (
+                "The database rejected that SQL with this error:\n"
+                f"{failed_attempt['error']}\n\n"
+                "Fix the query so it runs on this database, following the "
+                "dialect rules exactly, and answer the original question."
+            ),
+        })
 
     response = _client.messages.create(
         model=_model(),
@@ -162,6 +213,7 @@ def summarize_answer(
     rows: list[list],
     max_rows_shown: int = 5,
     has_chart: bool = False,
+    dialect: str = "SQL",
 ) -> str:
     """Produce a natural-language answer from the query results.
 
@@ -178,7 +230,7 @@ def summarize_answer(
     }
 
     system = (
-        "You answer the user's question about their Oracle database using the "
+        f"You answer the user's question about their {dialect} database using the "
         "SQL query that was run and its results. Be concise and direct. Lead "
         "with the answer. If the result is a single number, state it plainly. "
         "If it's a list, present it clearly (a short list or small table). Do "

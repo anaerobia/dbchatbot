@@ -1,0 +1,38 @@
+{
+  "default": "oracle_main",
+  "databases": [
+    {
+      "name": "oracle_main",
+      "label": "Oracle (main)",
+      "type": "oracle",
+      "host": "oracle-main.example.com",
+      "port": 1521,
+      "sid": "MAINSID",
+      "user": "chatbot_ro",
+      "password_env": "ORACLE_MAIN_PASSWORD"
+    },
+    {
+      "name": "oracle_archive",
+      "label": "Oracle (archive)",
+      "type": "oracle",
+      "host": "oracle-archive.example.com",
+      "port": 1521,
+      "service_name": "archive.example.com",
+      "user": "chatbot_ro",
+      "password_env": "ORACLE_ARCHIVE_PASSWORD",
+      "schemas": ["ARCHIVE_OWNER"]
+    },
+    {
+      "name": "analytics",
+      "label": "Analytics (Postgres)",
+      "type": "postgres",
+      "host": "pg.example.com",
+      "port": 5432,
+      "dbname": "analytics",
+      "user": "chatbot_ro",
+      "password_env": "ANALYTICS_PG_PASSWORD",
+      "schemas": ["public", "sales"],
+      "sslmode": "require"
+    }
+  ]
+}

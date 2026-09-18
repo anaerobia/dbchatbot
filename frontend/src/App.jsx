@@ -25,6 +25,52 @@ function Answer({ text }) {
   );
 }
 
+// Copy text to the clipboard, briefly flipping the label to confirm.
+function CopyButton({ text }) {
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard can be unavailable (e.g. non-HTTPS origin); the SQL is still
+      // selectable in the block below.
+    }
+  }
+
+  return (
+    <button className="copy" onClick={copy}>
+      {copied ? "Copied" : "Copy SQL"}
+    </button>
+  );
+}
+
+// A statement that would modify the database. The backend never executes
+// these; show the SQL prominently so the user can copy and run it themselves.
+function WriteStatement({ msg }) {
+  if (msg.executed === false) {
+    return <WriteStatement msg={msg} />;
+  }
+
+  return (
+    <div className="msg assistant">
+      <div className="bubble">
+        <Answer text={msg.answer} />
+        <div className="warning" role="alert">
+          <strong>Not executed.</strong> {msg.warning}
+        </div>
+        <div className="sql-head">
+          <span className="label">SQL for {msg.databaseLabel}</span>
+          <CopyButton text={msg.sql} />
+        </div>
+        <pre className="sql">{msg.sql}</pre>
+      </div>
+    </div>
+  );
+}
+
 // A single chat turn. `role` is "user" or "assistant". Assistant turns carry
 // the answer text plus the SQL/rows metadata for the expandable detail panel.
 function Message({ msg }) {
@@ -49,6 +95,10 @@ function Message({ msg }) {
     );
   }
 
+  if (msg.executed === false) {
+    return <WriteStatement msg={msg} />;
+  }
+
   return (
     <div className="msg assistant">
       <div className="bubble">
@@ -59,7 +109,10 @@ function Message({ msg }) {
         </button>
         {showDetails && (
           <div className="details">
-            <div className="label">Generated SQL</div>
+            <div className="sql-head">
+              <span className="label">Generated SQL ({msg.databaseLabel})</span>
+              <CopyButton text={msg.sql} />
+            </div>
             <pre className="sql">{msg.sql}</pre>
             {msg.columns?.length > 0 && (
               <>
@@ -99,7 +152,24 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [databases, setDatabases] = useState([]);
+  const [database, setDatabase] = useState("");
+  const [dbError, setDbError] = useState(null);
   const scrollRef = useRef(null);
+
+  // Load the configured databases for the selector.
+  useEffect(() => {
+    fetch("/api/databases")
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        setDatabases(data.databases);
+        setDatabase(data.default);
+      })
+      .catch((err) => setDbError(String(err.message || err)));
+  }, []);
+
+  const current = databases.find((d) => d.name === database);
 
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
@@ -113,13 +183,17 @@ export default function App() {
     // references (an omitted table name, "that table") to context. `messages`
     // here is the pre-update value — exactly the prior turns. Pair each user
     // question with the SQL of the assistant turn that answered it, keep the
-    // last 8 turns to bound token cost.
+    // last 8 turns to bound token cost. Only turns against the currently
+    // selected database count: SQL for another database (possibly another
+    // dialect) would mislead the model.
     const history = [];
     let lastQuestion = null;
     for (const m of messages) {
       if (m.role === "user") lastQuestion = m.text;
       else if (m.role === "assistant" && m.sql && lastQuestion != null) {
-        history.push({ question: lastQuestion, sql: m.sql });
+        if (m.database === database) {
+          history.push({ question: lastQuestion, sql: m.sql });
+        }
         lastQuestion = null;
       }
     }
@@ -133,7 +207,7 @@ export default function App() {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, history: recentHistory }),
+        body: JSON.stringify({ question, database, history: recentHistory }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -145,6 +219,12 @@ export default function App() {
           role: "assistant",
           answer: data.answer,
           sql: data.sql,
+          database: data.database,
+          databaseLabel:
+            databases.find((d) => d.name === data.database)?.label ??
+            data.database,
+          executed: data.executed,
+          warning: data.warning,
           columns: data.columns,
           rows: data.rows,
           row_count: data.row_count,
@@ -171,8 +251,31 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <h1>Oracle DB Chatbot</h1>
-        <p className="sub">Ask a question in plain English — it becomes SQL.</p>
+        <div className="header-row">
+          <h1>DB Chatbot</h1>
+          <label className="db-select">
+            Database
+            <select
+              value={database}
+              onChange={(e) => setDatabase(e.target.value)}
+              disabled={loading || databases.length === 0}
+            >
+              {databases.map((d) => (
+                <option key={d.name} value={d.name}>
+                  {d.label} ({d.dialect})
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <p className="sub">
+          Ask a question in plain English — it becomes SQL. Requests to change
+          the database produce SQL for you to run yourself; the chatbot only
+          executes read-only queries.
+        </p>
+        {dbError && (
+          <p className="db-error">Could not load databases: {dbError}</p>
+        )}
       </header>
 
       <div className="chat" ref={scrollRef}>
@@ -202,10 +305,15 @@ export default function App() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask about your database…"
+          placeholder={
+            current ? `Ask about ${current.label}…` : "Ask about your database…"
+          }
           rows={2}
         />
-        <button onClick={send} disabled={loading || !input.trim()}>
+        <button
+          onClick={send}
+          disabled={loading || !input.trim() || !database}
+        >
           Send
         </button>
       </div>
