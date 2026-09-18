@@ -102,6 +102,10 @@ class DatabasesResponse(BaseModel):
     databases: list[DatabaseInfo]
 
 
+# How many times a read query rejected by the database is sent back to the
+# LLM, with the error, for a corrected version.
+SQL_REPAIR_ATTEMPTS = 1
+
 NOT_EXECUTED_WARNING = (
     "This statement modifies the database, so the chatbot did not execute it. "
     "Review it carefully, then copy it and run it yourself with a tool and "
@@ -209,6 +213,28 @@ def schema(database: str | None = None) -> dict:
         raise HTTPException(status_code=503, detail=str(exc))
 
 
+def _generate(
+    target: db.Database,
+    question: str,
+    history: list[dict],
+    failed_attempt: dict | None,
+) -> dict:
+    """Ask the LLM for SQL in ``target``'s dialect; map failures to HTTP 502."""
+    try:
+        generated = llm.generate_sql(
+            question,
+            target.get_schema_description(),
+            dialect_context=target.dialect_context(),
+            history=history,
+            failed_attempt=failed_attempt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Failed to generate SQL: {exc}")
+    if not generated.get("sql", "").strip():
+        raise HTTPException(status_code=502, detail="Model returned empty SQL.")
+    return generated
+
+
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     """Answer a natural-language question about the database."""
@@ -219,48 +245,46 @@ def ask(req: AskRequest) -> AskResponse:
     max_rows = int(os.environ.get("MAX_ROWS", "1000"))
     target = _resolve_database(req.database)
 
-    # 1. Natural language -> SQL in the target database's dialect
-    try:
-        schema_description = target.get_schema_description()
-        history = [t.model_dump() for t in req.history]
-        generated = llm.generate_sql(
-            question,
-            schema_description,
-            dialect=target.dialect,
-            dialect_rules=target.dialect_rules,
-            history=history,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Failed to generate SQL: {exc}")
+    history = [t.model_dump() for t in req.history]
+    failed_attempt: dict | None = None
 
-    sql = generated["sql"].strip()
-    explanation = generated.get("explanation", "")
-    if not sql:
-        raise HTTPException(status_code=502, detail="Model returned empty SQL.")
+    # A read query that the database rejects (typically a dialect slip, e.g.
+    # LIMIT on Oracle) gets one repair attempt with the error fed back.
+    for attempt in range(1 + SQL_REPAIR_ATTEMPTS):
+        # 1. Natural language -> SQL in the target database's dialect
+        generated = _generate(target, question, history, failed_attempt)
+        sql = generated["sql"].strip()
+        explanation = generated.get("explanation", "")
 
-    # 2a. Anything that is not a safe read-only query -- whether the model
-    # labelled it a write or the guard rejects it -- is handed back to the
-    # user to run themselves, never executed here.
-    if generated.get("statement_type") == "write" or not db.is_read_only(sql):
-        return AskResponse(
-            answer=explanation or "Here is the SQL statement for your request.",
-            sql=sql,
-            explanation=explanation,
-            database=target.name,
-            executed=False,
-            warning=NOT_EXECUTED_WARNING,
-        )
+        # 2a. Anything that is not a safe read-only query -- whether the model
+        # labelled it a write or the guard rejects it -- is handed back to the
+        # user to run themselves, never executed here.
+        if generated.get("statement_type") == "write" or not db.is_read_only(sql):
+            return AskResponse(
+                answer=explanation or "Here is the SQL statement for your request.",
+                sql=sql,
+                explanation=explanation,
+                database=target.name,
+                executed=False,
+                warning=NOT_EXECUTED_WARNING,
+            )
 
-    # 2b. Execute (the read-only guard is enforced again inside run_select)
-    try:
-        columns, rows = target.run_select(sql, max_rows=max_rows)
-    except db.UnsafeQueryError as exc:
-        raise HTTPException(status_code=400, detail=f"Rejected unsafe query: {exc}")
-    except Exception as exc:  # noqa: BLE001 - driver/database errors
-        raise HTTPException(
-            status_code=400,
-            detail=f"Query failed: {exc}\n\nGenerated SQL:\n{sql}",
-        )
+        # 2b. Execute (the read-only guard is enforced again inside run_select)
+        try:
+            columns, rows = target.run_select(sql, max_rows=max_rows)
+            break
+        except db.UnsafeQueryError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Rejected unsafe query: {exc}"
+            )
+        except Exception as exc:  # noqa: BLE001 - driver/database errors
+            if attempt == SQL_REPAIR_ATTEMPTS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query failed: {exc}\n\nGenerated SQL:\n{sql}",
+                )
+            print(f"[ask] {target.name}: query failed, retrying: {exc}", flush=True)
+            failed_attempt = {"sql": sql, "error": str(exc)}
 
     # Build the chart first so the summary knows a graphic is being shown.
     chart = _build_chart(generated.get("chart"), columns, rows)

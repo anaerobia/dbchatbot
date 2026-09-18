@@ -8,13 +8,33 @@ import psycopg
 
 from db.base import Database
 
-_POSTGRES_RULES = (
-    "- PostgreSQL dialect. Do NOT end a read query with a semicolon.\n"
-    "- To limit rows use `LIMIT n`.\n"
-    "- Unquoted identifiers fold to lowercase; double-quote mixed-case names.\n"
-    "- Qualify tables with their schema exactly as they appear in the schema "
-    "listing (e.g. `sales.orders`)."
-)
+_POSTGRES_RULES = """\
+- Do NOT end a read query with a semicolon.
+- Row limits: `LIMIT n [OFFSET m]`. Never use ROWNUM, TOP, or `FROM dual`.
+- Unquoted identifiers fold to lowercase; write names exactly as shown in the
+  schema listing, including any double quotes (e.g. `"zip code"`).
+- Qualify tables with their schema as in the listing (e.g. `public.film`).
+- Dates: now() / CURRENT_DATE / CURRENT_TIMESTAMP; date_trunc('month', ts),
+  EXTRACT(YEAR FROM ts), ts + INTERVAL '1 day', age(), to_char(ts, fmt),
+  DATE '2024-01-31'. No SYSDATE, ADD_MONTHS, or TO_DATE-style Oracle idioms.
+- Strings: `||` or concat(), substring(), position(), COALESCE (no NVL),
+  string_agg(x, ',' ORDER BY x) (no LISTAGG). Case-insensitive match: ILIKE.
+- Casts with `::type` or CAST. Integer division truncates -- cast to numeric
+  for ratios. ROUND(x, n) only accepts numeric: cast double precision
+  values (e.g. from avg() over floats, EXTRACT) to numeric first.
+- Enum/domain columns (shown by their type name) compare to string literals.
+  Arrays: `'x' = ANY(col)`, `col @> ARRAY['x']`. jsonb: `->`, `->>`, `@>`.
+- Booleans are real BOOLEAN (`WHERE active`, `TRUE/FALSE`).
+- FILTER (WHERE ...) on aggregates, DISTINCT ON, and window functions are
+  available.
+- DDL types: text / varchar(n), integer, bigint, numeric(p,s), boolean,
+  timestamptz, date, jsonb. Auto keys: `GENERATED ALWAYS AS IDENTITY`.
+- Upserts: INSERT ... ON CONFLICT (cols) DO UPDATE SET col = EXCLUDED.col
+  (MERGE also exists in 15+). RETURNING is available. IF [NOT] EXISTS is
+  supported on CREATE/DROP.
+- Multi-row insert: INSERT ... VALUES (...), (...).
+- Wrap multi-statement changes in BEGIN; ... COMMIT; so they apply atomically.
+"""
 
 DEFAULT_SCHEMAS = ["public"]
 DEFAULT_STATEMENT_TIMEOUT_MS = 60_000
@@ -81,6 +101,11 @@ class PostgresDatabase(Database):
             rows = cur.fetchmany(max_rows) if cur.description else []
             conn.rollback()
             return columns, rows
+
+    def _fetch_server_version(self) -> str:
+        """Return the ``server_version`` reported by the server (e.g. ``18.0``)."""
+        with self._connect() as conn:
+            return conn.info.parameter_status("server_version") or "unknown"
 
     def _fetch_columns(self) -> list[tuple[str, str, str]]:
         """Read table/view column metadata from ``pg_catalog``.

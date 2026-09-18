@@ -21,8 +21,12 @@ NL question ──▶ Claude (generate SQL) ──▶ read-only execute ──�
 
 - **Multiple databases** — Oracle (by SID or service name) and PostgreSQL,
   configured in `backend/databases.json`. Each request is dispatched to the
-  selected database through a common `Database` interface (`backend/db/`), and
-  the SQL is generated in that database's dialect.
+  selected database through a common `Database` interface (`backend/db/`).
+- **Dialect-correct SQL** — each backend supplies detailed dialect rules
+  (row limits, date/string functions, DDL types, upsert syntax, …) and its
+  detected server version, so Oracle gets `FETCH FIRST`/`MERGE`/`SYSDATE` and
+  Postgres gets `LIMIT`/`ON CONFLICT`/`now()`. If a read query is rejected by
+  the database, the error is sent back to Claude once for a corrected query.
 - **SQL for changes, never executed** — ask for an insert/update/delete, a new
   table, a grant, etc. and the bot writes the statement(s) for you, with a
   **Copy SQL** button and a warning that the chatbot will not run it. Copy it

@@ -123,11 +123,18 @@ _SQL_INSTRUCTIONS = (
 def generate_sql(
     question: str,
     schema_description: str,
-    dialect: str,
-    dialect_rules: str,
+    dialect_context: str,
     history: list[dict] | None = None,
+    failed_attempt: dict | None = None,
 ) -> dict:
-    """Generate SQL in ``dialect`` for ``question``.
+    """Generate SQL for ``question`` in the target database's dialect.
+
+    ``dialect_context`` names the dialect and server version and lists the
+    dialect's rules (see :meth:`db.base.Database.dialect_context`).
+
+    ``failed_attempt`` (``{"sql": str, "error": str}``) is a previous answer
+    to this same question that the database rejected; the model is shown the
+    error and asked for a corrected query.
 
     Returns a dict with ``statement_type`` (``"read"``/``"write"``), ``sql``,
     ``explanation`` and ``chart`` keys.
@@ -149,8 +156,7 @@ def generate_sql(
         {
             "type": "text",
             "text": (
-                f"Database dialect: {dialect}\n"
-                f"Dialect rules:\n{dialect_rules}\n\n"
+                f"{dialect_context}\n\n"
                 f"Schema (table(column type, ...)):\n{schema_description}"
             ),
             "cache_control": {"type": "ephemeral"},
@@ -164,6 +170,17 @@ def generate_sql(
         # model can see which table/columns the conversation is about.
         messages.append({"role": "assistant", "content": turn["sql"]})
     messages.append({"role": "user", "content": question})
+    if failed_attempt:
+        messages.append({"role": "assistant", "content": failed_attempt["sql"]})
+        messages.append({
+            "role": "user",
+            "content": (
+                "The database rejected that SQL with this error:\n"
+                f"{failed_attempt['error']}\n\n"
+                "Fix the query so it runs on this database, following the "
+                "dialect rules exactly, and answer the original question."
+            ),
+        })
 
     response = _client.messages.create(
         model=_model(),

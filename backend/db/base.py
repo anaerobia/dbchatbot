@@ -21,15 +21,17 @@ class Database(ABC):
     """One configured database the chatbot can query.
 
     Subclasses set :attr:`kind`, :attr:`dialect` and :attr:`dialect_rules`,
-    and implement the driver-specific hooks :meth:`_execute_read_only` and
-    :meth:`_fetch_columns`.
+    and implement the driver-specific hooks :meth:`_execute_read_only`,
+    :meth:`_fetch_columns` and :meth:`_fetch_server_version`.
     """
 
     #: Backend type identifier, as used in the config file (e.g. "oracle").
     kind: str = ""
     #: Human-readable SQL dialect name, used in LLM prompts (e.g. "Oracle").
     dialect: str = ""
-    #: Dialect-specific rules appended to the SQL-generation prompt.
+    #: Dialect-specific rules for the SQL-generation prompt. Should cover both
+    #: queries and data/DDL statements, since write requests are answered with
+    #: SQL the user runs themselves.
     dialect_rules: str = ""
     #: Cheap query used by the health check.
     health_query: str = "SELECT 1"
@@ -44,7 +46,8 @@ class Database(ABC):
         self.name = name
         self.label = label or name
         self._schema_cache: str | None = None
-        self._schema_lock = threading.Lock()
+        self._version_cache: str | None = None
+        self._cache_lock = threading.Lock()
 
     def run_select(self, sql: str, max_rows: int) -> tuple[list[str], list[list]]:
         """Validate and execute a read-only query.
@@ -74,10 +77,31 @@ class Database(ABC):
         Computed once per process and cached (the schema is part of the
         prompt-cached prefix, so it should stay byte-stable).
         """
-        with self._schema_lock:
+        with self._cache_lock:
             if self._schema_cache is None:
                 self._schema_cache = _format_schema(self._fetch_columns())
             return self._schema_cache
+
+    def get_server_version(self) -> str:
+        """Return the database server version string (cached per process).
+
+        Dialects differ by version (e.g. Oracle only has ``FETCH FIRST`` from
+        12c and ``BOOLEAN`` from 23ai), so the version goes into the prompt.
+        """
+        with self._cache_lock:
+            if self._version_cache is None:
+                self._version_cache = self._fetch_server_version()
+            return self._version_cache
+
+    def dialect_context(self) -> str:
+        """Return the dialect, server version and rules block for the LLM."""
+        return (
+            f"Database dialect: {self.dialect} "
+            f"(server version {self.get_server_version()})\n"
+            f"Write ALL SQL -- queries and change statements alike -- in this "
+            f"dialect and version. Do not use syntax from other databases.\n"
+            f"{self.dialect} rules:\n{self.dialect_rules}"
+        )
 
     @abstractmethod
     def _execute_read_only(
@@ -92,6 +116,10 @@ class Database(ABC):
     @abstractmethod
     def _fetch_columns(self) -> list[tuple[str, str, str]]:
         """Return ``(table_name, column_name, data_type)`` rows, in order."""
+
+    @abstractmethod
+    def _fetch_server_version(self) -> str:
+        """Return the server version as a human-readable string."""
 
 
 def _format_schema(rows: list[tuple[str, str, str]]) -> str:
