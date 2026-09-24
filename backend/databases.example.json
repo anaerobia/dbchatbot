@@ -33,6 +33,17 @@
       "password_env": "ANALYTICS_PG_PASSWORD",
       "schemas": ["public", "sales"],
       "sslmode": "require"
+    },
+    {
+      "name": "local_pg",
+      "label": "Local (Postgres)",
+      "type": "postgres",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "dbname": "pagila",
+      "user": "your_macos_username",
+      "password": "",
+      "schemas": ["public"]
     }
   ]
 }
