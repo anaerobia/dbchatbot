@@ -155,6 +155,14 @@ Give the password as `"password_env": "VAR_NAME"` (read from `.env`/the
 environment — recommended) or inline as `"password"`. Set `DATABASES_CONFIG`
 to use a different file path.
 
+A password is always required, so a local Postgres that uses `trust`
+authentication (Postgres.app's default) needs an explicit empty one:
+`"password": ""`.
+
+Every entry is built when the config loads, so a single bad entry — a
+`password_env` naming a variable that isn't set, say — fails startup for *all*
+databases, not just that one.
+
 **Backward compatible:** if `databases.json` doesn't exist, the old
 `ORACLE_HOST` / `ORACLE_PORT` / `ORACLE_SID` / `ORACLE_USER` /
 `ORACLE_PASSWORD` variables in `.env` still define a single database named
