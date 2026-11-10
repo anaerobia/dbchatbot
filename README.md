@@ -135,7 +135,7 @@ Edit `backend/.env`:
   login` and leave it unset).
 - The database passwords referenced by `password_env` in `databases.json`.
 
-### Use a local LLM instead of Claude (LM Studio)
+### Use a local LLM instead of Claude (LM Studio, Ollama, vLLM)
 
 The LLM is configurable with `LLM_PROVIDER`. To run with no API cost on a
 local model served by [LM Studio](https://lmstudio.ai/) (or any other
@@ -155,6 +155,35 @@ OpenAI-compatible server — Ollama, vLLM, llama.cpp):
    ```
 
    `ANTHROPIC_API_KEY` is not needed in this mode.
+
+#### Other servers (Ollama, vLLM, ...)
+
+Any OpenAI-compatible server is interchangeable — only `backend/.env`
+changes (`lmstudio`, `openai` and `local` are aliases):
+
+| Server    | `LLM_PROVIDER` | `LLM_BASE_URL`                       | `LLM_MODEL` example                   |
+|-----------|----------------|--------------------------------------|---------------------------------------|
+| Claude    | `anthropic`    | —  (use `ANTHROPIC_MODEL`)           | `claude-opus-4-8`                     |
+| LM Studio | `lmstudio`     | `http://localhost:1234/v1` (default) | `qwen2.5-coder-14b-instruct`          |
+| Ollama    | `openai`       | `http://localhost:11434/v1`          | `qwen2.5-coder:14b`                   |
+| vLLM      | `openai`       | `http://<host>:8000/v1`              | `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ` |
+
+`LLM_MODEL` must match the server's own model name exactly. Make sure the
+server's context window fits the schema (at least 8k), or the schema is
+silently truncated:
+
+- **Ollama**: the default is small — start it with
+  `OLLAMA_CONTEXT_LENGTH=8192 ollama serve`. For several simultaneous users,
+  also set `OLLAMA_NUM_PARALLEL`.
+- **vLLM**: `vllm serve <model> --max-model-len 8192` (NVIDIA GPU on Linux).
+
+Hosted OpenAI-compatible APIs work the same way; set `LLM_API_KEY` to their
+key.
+
+To confirm which backend answered, check the backend log: `[openai] input=…`
+means the local/OpenAI-compatible server, `[generate_sql] cache_read=…` means
+Claude. An invalid `LLM_PROVIDER` or missing `LLM_MODEL` stops the backend at
+startup with an error.
 
 SQL generation asks the server for JSON matching a schema (`response_format:
 json_schema`), which LM Studio enforces; servers that reject it are retried
