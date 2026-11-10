@@ -26,6 +26,8 @@ from pydantic import BaseModel  # noqa: E402
 import db  # noqa: E402
 import llm  # noqa: E402
 
+llm.check_config()  # fail at startup, not per request, on bad LLM settings
+
 app = FastAPI(title="DB Chatbot")
 
 _origins = [

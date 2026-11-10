@@ -157,7 +157,8 @@ OpenAI-compatible server — Ollama, vLLM, llama.cpp):
    `ANTHROPIC_API_KEY` is not needed in this mode.
 
 SQL generation asks the server for JSON matching a schema (`response_format:
-json_schema`), which LM Studio enforces; `<think>` blocks from reasoning
+json_schema`), which LM Studio enforces; servers that reject it are retried
+without it, with the schema in the prompt instead. `<think>` blocks from reasoning
 models and stray code fences are stripped. Prompt caching and adaptive
 thinking are Claude-only features and are skipped. Expect lower SQL accuracy
 than Claude on complex schemas — the one automatic repair retry helps.

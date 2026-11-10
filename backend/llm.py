@@ -44,6 +44,12 @@ def _provider() -> str:
     return name
 
 
+def check_config() -> None:
+    """Fail fast at startup on a bad LLM_PROVIDER / missing LLM_MODEL."""
+    _provider()
+    _model()
+
+
 @cache
 def _anthropic_client():
     # Imported lazily so a local-only setup never needs ANTHROPIC_API_KEY.
@@ -78,8 +84,18 @@ def _model() -> str:
 
 
 def _strip_reasoning(text: str) -> str:
-    """Drop ``<think>...</think>`` blocks emitted by local reasoning models."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    """Drop chain-of-thought emitted by local reasoning models.
+
+    Handles closed ``<think>...</think>`` blocks, output whose opening tag was
+    added by the chat template (only ``</think>`` appears), and reasoning cut
+    off by the token limit (``<think>`` never closed).
+    """
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    if "<think>" in text:
+        text = text.split("<think>", 1)[0]
+    return text.strip()
 
 
 def _parse_json(text: str) -> dict:
@@ -90,12 +106,15 @@ def _parse_json(text: str) -> dict:
     """
     text = _strip_reasoning(text)
     try:
-        return json.loads(text)
+        result = json.loads(text)
     except json.JSONDecodeError:
         start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(text[start : end + 1])
-        raise RuntimeError(f"Model did not return JSON: {text[:200]!r}")
+        if start == -1 or end <= start:
+            raise RuntimeError(f"Model did not return JSON: {text[:200]!r}")
+        result = json.loads(text[start : end + 1])
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Model returned JSON that is not an object: {text[:200]!r}")
+    return result
 
 
 def _openai_chat(
@@ -105,20 +124,36 @@ def _openai_chat(
     json_schema: dict | None = None,
 ) -> str:
     """One Chat Completions call to the OpenAI-compatible server."""
-    kwargs: dict = {}
-    if json_schema is not None:
-        # LM Studio enforces this schema with grammar-constrained sampling.
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "result", "strict": True, "schema": json_schema},
-        }
-    response = _openai_client().chat.completions.create(
-        model=_model(),
-        max_tokens=max_tokens,
-        temperature=0,
-        messages=[{"role": "system", "content": system}, *messages],
-        **kwargs,
-    )
+    from openai import BadRequestError
+
+    request: dict = {
+        "model": _model(),
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "messages": [{"role": "system", "content": system}, *messages],
+    }
+    if json_schema is None:
+        response = _openai_client().chat.completions.create(**request)
+    else:
+        try:
+            # LM Studio enforces this schema with grammar-constrained sampling.
+            response = _openai_client().chat.completions.create(
+                **request,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "result", "strict": True, "schema": json_schema},
+                },
+            )
+        except BadRequestError as exc:
+            # Some OpenAI-compatible servers don't support json_schema. Retry
+            # without it; the prompt asks for JSON and _parse_json is lenient.
+            print(f"[openai] json_schema rejected, retrying without it: {exc}", flush=True)
+            schema_hint = (
+                "\n\nReply with ONLY a JSON object matching this JSON Schema, "
+                f"no other text:\n{json.dumps(json_schema)}"
+            )
+            request["messages"][0] = {"role": "system", "content": system + schema_hint}
+            response = _openai_client().chat.completions.create(**request)
     u = response.usage
     if u is not None:
         print(
