@@ -48,7 +48,7 @@ NL question ──▶ Claude (generate SQL) ──▶ read-only execute ──�
 
 - **Backend:** FastAPI, [`oracledb`](https://python-oracledb.readthedocs.io/) (thin
   mode — no Oracle client install needed),
-  [`psycopg`](https://www.psycopg.org/psycopg3/) 3 for PostgreSQL, `anthropic` SDK (`claude-opus-4-8`);
+  [`psycopg`](https://www.psycopg.org/psycopg3/) 3 for PostgreSQL, `anthropic` SDK (`claude-opus-4-8`) or the `openai` SDK against a local OpenAI-compatible server such as LM Studio;
   deps managed by [`uv`](https://docs.astral.sh/uv/) (`pyproject.toml` + `uv.lock`).
 - **Frontend:** React 18 + Vite, `react-markdown` for answer rendering.
 
@@ -134,6 +134,33 @@ Edit `backend/.env`:
 - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/ (or run `ant auth
   login` and leave it unset).
 - The database passwords referenced by `password_env` in `databases.json`.
+
+### Use a local LLM instead of Claude (LM Studio)
+
+The LLM is configurable with `LLM_PROVIDER`. To run with no API cost on a
+local model served by [LM Studio](https://lmstudio.ai/) (or any other
+OpenAI-compatible server — Ollama, vLLM, llama.cpp):
+
+1. In LM Studio, download a model that is good at SQL and instruction
+   following (e.g. a Qwen2.5-Coder 7B/14B/32B instruct build).
+2. Open the **Developer** tab, load the model, and **Start Server** (default
+   `http://localhost:1234`). Set the context length to at least 8k — the
+   schema is sent with every question.
+3. In `backend/.env`:
+
+   ```bash
+   LLM_PROVIDER=lmstudio
+   LLM_MODEL=qwen2.5-coder-14b-instruct   # identifier shown in LM Studio
+   # LLM_BASE_URL=http://localhost:1234/v1 # default
+   ```
+
+   `ANTHROPIC_API_KEY` is not needed in this mode.
+
+SQL generation asks the server for JSON matching a schema (`response_format:
+json_schema`), which LM Studio enforces; `<think>` blocks from reasoning
+models and stray code fences are stripped. Prompt caching and adaptive
+thinking are Claude-only features and are skipped. Expect lower SQL accuracy
+than Claude on complex schemas — the one automatic repair retry helps.
 
 ### Configure databases
 

@@ -1,4 +1,4 @@
-"""Anthropic API interaction.
+"""LLM interaction (Anthropic API, or a local OpenAI-compatible server).
 
 Two steps:
 
@@ -10,7 +10,15 @@ Two steps:
 2. :func:`summarize_answer` — turn the query + result rows into a
    natural-language answer.
 
-Uses the official ``anthropic`` SDK (Messages API) with ``claude-opus-4-8``.
+Provider is chosen with ``LLM_PROVIDER``:
+
+- ``anthropic`` (default): the official ``anthropic`` SDK (Messages API),
+  model from ``ANTHROPIC_MODEL`` (default ``claude-opus-4-8``). Uses prompt
+  caching and adaptive thinking.
+- ``openai`` (aliases ``lmstudio``, ``local``): any OpenAI-compatible Chat
+  Completions server -- LM Studio, Ollama, vLLM, llama.cpp server, ... --
+  at ``LLM_BASE_URL`` (default LM Studio's ``http://localhost:1234/v1``) with
+  model ``LLM_MODEL``. No API cost; quality depends on the local model.
 """
 
 from __future__ import annotations
@@ -18,15 +26,106 @@ from __future__ import annotations
 import json
 import os
 
-import anthropic
+import re
+from functools import cache
 
-# One shared client; it reads ANTHROPIC_API_KEY from the environment (or an
-# `ant auth login` profile) automatically.
-_client = anthropic.Anthropic()
+_OPENAI_ALIASES = {"openai", "lmstudio", "local"}
+
+
+def _provider() -> str:
+    """``"anthropic"`` or ``"openai"`` (any OpenAI-compatible server)."""
+    name = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
+    if name in _OPENAI_ALIASES:
+        return "openai"
+    if name != "anthropic":
+        raise RuntimeError(
+            f"Unknown LLM_PROVIDER={name!r}; use 'anthropic' or 'lmstudio'/'openai'."
+        )
+    return name
+
+
+@cache
+def _anthropic_client():
+    # Imported lazily so a local-only setup never needs ANTHROPIC_API_KEY.
+    # The client reads ANTHROPIC_API_KEY (or an `ant auth login` profile).
+    import anthropic
+
+    return anthropic.Anthropic()
+
+
+@cache
+def _openai_client():
+    from openai import OpenAI
+
+    return OpenAI(
+        base_url=os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
+        # Local servers ignore the key, but the SDK requires a non-empty one.
+        api_key=os.environ.get("LLM_API_KEY", "lm-studio"),
+        timeout=float(os.environ.get("LLM_TIMEOUT", "300")),
+    )
 
 
 def _model() -> str:
+    if _provider() == "openai":
+        model = os.environ.get("LLM_MODEL", "").strip()
+        if not model:
+            raise RuntimeError(
+                "LLM_MODEL is not set. Set it to the model identifier shown in "
+                "LM Studio (e.g. qwen2.5-coder-14b-instruct)."
+            )
+        return model
     return os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+
+
+def _strip_reasoning(text: str) -> str:
+    """Drop ``<think>...</think>`` blocks emitted by local reasoning models."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _parse_json(text: str) -> dict:
+    """Parse a JSON object, tolerating code fences or prose around it.
+
+    Claude's structured outputs return clean JSON; small local models
+    sometimes wrap it in ```json fences or add a sentence before it.
+    """
+    text = _strip_reasoning(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(text[start : end + 1])
+        raise RuntimeError(f"Model did not return JSON: {text[:200]!r}")
+
+
+def _openai_chat(
+    system: str,
+    messages: list[dict],
+    max_tokens: int,
+    json_schema: dict | None = None,
+) -> str:
+    """One Chat Completions call to the OpenAI-compatible server."""
+    kwargs: dict = {}
+    if json_schema is not None:
+        # LM Studio enforces this schema with grammar-constrained sampling.
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "result", "strict": True, "schema": json_schema},
+        }
+    response = _openai_client().chat.completions.create(
+        model=_model(),
+        max_tokens=max_tokens,
+        temperature=0,
+        messages=[{"role": "system", "content": system}, *messages],
+        **kwargs,
+    )
+    u = response.usage
+    if u is not None:
+        print(
+            f"[{_provider()}] input={u.prompt_tokens} output={u.completion_tokens}",
+            flush=True,
+        )
+    return response.choices[0].message.content or ""
 
 
 _SQL_SCHEMA = {
@@ -182,7 +281,13 @@ def generate_sql(
             ),
         })
 
-    response = _client.messages.create(
+    if _provider() == "openai":
+        system_text = "\n\n".join(block["text"] for block in system)
+        # Local models (esp. reasoning ones) can need room beyond the JSON.
+        text = _openai_chat(system_text, messages, 4000, json_schema=_SQL_SCHEMA)
+        return _parse_json(text)
+
+    response = _anthropic_client().messages.create(
         model=_model(),
         max_tokens=2000,
         thinking={"type": "adaptive"},
@@ -252,10 +357,14 @@ def summarize_answer(
         f"Results (JSON):\n{json.dumps(result_payload, default=str)}"
     )
 
-    response = _client.messages.create(
+    messages = [{"role": "user", "content": user}]
+    if _provider() == "openai":
+        return _strip_reasoning(_openai_chat(system, messages, 4000))
+
+    response = _anthropic_client().messages.create(
         model=_model(),
         max_tokens=2000,
         system=system,
-        messages=[{"role": "user", "content": user}],
+        messages=messages,
     )
     return "".join(b.text for b in response.content if b.type == "text").strip()
