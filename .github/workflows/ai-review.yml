@@ -60,7 +60,9 @@ jobs:
             exit 1
           fi
 
-          REVIEW_TEXT=$(jq -r '.result // empty' "$RESULT_FILE")
+          # The action writes either one result object or an array of SDK
+          # messages (the final one has type "result"); accept both.
+          REVIEW_TEXT=$(jq -r 'if type == "array" then (map(select(.type == "result")) | last | .result) else .result end // empty' "$RESULT_FILE")
           if [ -z "$REVIEW_TEXT" ]; then
             echo "Empty review text — failing closed."
             exit 1
