@@ -45,9 +45,22 @@ def _provider() -> str:
 
 
 def check_config() -> None:
-    """Fail fast at startup on a bad LLM_PROVIDER / missing LLM_MODEL."""
-    _provider()
+    """Fail fast at startup on bad LLM settings instead of on each request."""
+    if _provider() == "openai":
+        _timeout()
     _model()
+
+
+def _timeout() -> float:
+    """``LLM_TIMEOUT`` in seconds (OpenAI-compatible provider only)."""
+    raw = os.environ.get("LLM_TIMEOUT", "300")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        raise RuntimeError(f"LLM_TIMEOUT must be a positive number of seconds, got {raw!r}.")
+    return value
 
 
 @cache
@@ -67,7 +80,7 @@ def _openai_client():
         base_url=os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
         # Local servers ignore the key, but the SDK requires a non-empty one.
         api_key=os.environ.get("LLM_API_KEY", "lm-studio"),
-        timeout=float(os.environ.get("LLM_TIMEOUT", "300")),
+        timeout=_timeout(),
     )
 
 
@@ -114,6 +127,37 @@ def _parse_json(text: str) -> dict:
         result = json.loads(text[start : end + 1])
     if not isinstance(result, dict):
         raise RuntimeError(f"Model returned JSON that is not an object: {text[:200]!r}")
+    return result
+
+
+_NO_CHART = {"type": "none", "title": "", "label_column": "", "value_column": ""}
+
+
+def _validate_sql_result(result: dict) -> dict:
+    """Check the shape of a generate_sql result from an OpenAI-compatible server.
+
+    Claude's structured outputs guarantee ``_SQL_SCHEMA``; a local model --
+    especially on the no-``json_schema`` fallback -- may not follow it. Invalid
+    required fields raise ``RuntimeError`` (reported as a 502); a malformed
+    optional chart is dropped rather than failing the whole question.
+    """
+    if result.get("statement_type") not in ("read", "write"):
+        raise RuntimeError(
+            f"Model returned an invalid statement_type: {result.get('statement_type')!r}"
+        )
+    if not isinstance(result.get("sql"), str):
+        raise RuntimeError(f"Model returned non-string sql: {result.get('sql')!r}")
+    explanation = result.get("explanation")
+    result["explanation"] = explanation if isinstance(explanation, str) else ""
+
+    chart = result.get("chart")
+    keys = ("type", "title", "label_column", "value_column")
+    if (
+        not isinstance(chart, dict)
+        or not all(isinstance(chart.get(k), str) for k in keys)
+        or chart["type"] not in ("none", "pie", "bar", "line")
+    ):
+        result["chart"] = dict(_NO_CHART)
     return result
 
 
@@ -320,7 +364,7 @@ def generate_sql(
         system_text = "\n\n".join(block["text"] for block in system)
         # Local models (esp. reasoning ones) can need room beyond the JSON.
         text = _openai_chat(system_text, messages, 4000, json_schema=_SQL_SCHEMA)
-        return _parse_json(text)
+        return _validate_sql_result(_parse_json(text))
 
     response = _anthropic_client().messages.create(
         model=_model(),
