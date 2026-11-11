@@ -4,8 +4,8 @@ Several databases (Oracle instances, Postgres databases, ...) can be
 configured; each request names the one to use (see :mod:`db.registry`).
 
 Flow for POST /api/ask:
-  question -> Anthropic (generate SQL for the target dialect) ->
-    read query:  read-only execute -> Anthropic (summarize) -> answer
+  question -> LLM (generate SQL for the target dialect) ->
+    read query:  read-only execute -> LLM (summarize) -> answer
                  (+ the SQL and rows, for transparency)
     write/other: NOT executed -> SQL returned for the user to copy, with a
                  warning that the chatbot cannot run it.
@@ -25,6 +25,8 @@ from pydantic import BaseModel  # noqa: E402
 
 import db  # noqa: E402
 import llm  # noqa: E402
+
+llm.check_config()  # fail at startup, not per request, on bad LLM settings
 
 app = FastAPI(title="DB Chatbot")
 

@@ -1,7 +1,7 @@
 [project]
 name = "dbchatbot-backend"
 version = "0.1.0"
-description = "Natural-language database chatbot backend (Oracle, PostgreSQL) (FastAPI + Anthropic)"
+description = "Natural-language database chatbot backend (Oracle, PostgreSQL) (FastAPI + Anthropic or a local OpenAI-compatible LLM)"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.115.6",
@@ -11,6 +11,7 @@ dependencies = [
     "python-dotenv==1.0.1",
     "pydantic==2.10.4",
     "psycopg[binary]==3.3.5",
+    "openai==2.54.0",
 ]
 
 [tool.uv]

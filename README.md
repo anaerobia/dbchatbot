@@ -48,7 +48,7 @@ NL question ──▶ Claude (generate SQL) ──▶ read-only execute ──�
 
 - **Backend:** FastAPI, [`oracledb`](https://python-oracledb.readthedocs.io/) (thin
   mode — no Oracle client install needed),
-  [`psycopg`](https://www.psycopg.org/psycopg3/) 3 for PostgreSQL, `anthropic` SDK (`claude-opus-4-8`);
+  [`psycopg`](https://www.psycopg.org/psycopg3/) 3 for PostgreSQL, `anthropic` SDK (`claude-opus-4-8`) or the `openai` SDK against a local OpenAI-compatible server such as LM Studio;
   deps managed by [`uv`](https://docs.astral.sh/uv/) (`pyproject.toml` + `uv.lock`).
 - **Frontend:** React 18 + Vite, `react-markdown` for answer rendering.
 
@@ -134,6 +134,63 @@ Edit `backend/.env`:
 - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/ (or run `ant auth
   login` and leave it unset).
 - The database passwords referenced by `password_env` in `databases.json`.
+
+### Use a local LLM instead of Claude (LM Studio, Ollama, vLLM)
+
+The LLM is configurable with `LLM_PROVIDER`. To run with no API cost on a
+local model served by [LM Studio](https://lmstudio.ai/) (or any other
+OpenAI-compatible server — Ollama, vLLM, llama.cpp):
+
+1. In LM Studio, download a model that is good at SQL and instruction
+   following (e.g. a Qwen2.5-Coder 7B/14B/32B instruct build).
+2. Open the **Developer** tab, load the model, and **Start Server** (default
+   `http://localhost:1234`). Set the context length to at least 8k — the
+   schema is sent with every question.
+3. In `backend/.env`:
+
+   ```bash
+   LLM_PROVIDER=lmstudio
+   LLM_MODEL=qwen2.5-coder-14b-instruct   # identifier shown in LM Studio
+   # LLM_BASE_URL=http://localhost:1234/v1 # default
+   ```
+
+   `ANTHROPIC_API_KEY` is not needed in this mode.
+
+#### Other servers (Ollama, vLLM, ...)
+
+Any OpenAI-compatible server is interchangeable — only `backend/.env`
+changes (`lmstudio`, `openai` and `local` are aliases):
+
+| Server    | `LLM_PROVIDER` | `LLM_BASE_URL`                       | `LLM_MODEL` example                   |
+|-----------|----------------|--------------------------------------|---------------------------------------|
+| Claude    | `anthropic`    | —  (use `ANTHROPIC_MODEL`)           | `claude-opus-4-8`                     |
+| LM Studio | `lmstudio`     | `http://localhost:1234/v1` (default) | `qwen2.5-coder-14b-instruct`          |
+| Ollama    | `openai`       | `http://localhost:11434/v1`          | `qwen2.5-coder:14b`                   |
+| vLLM      | `openai`       | `http://<host>:8000/v1`              | `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ` |
+
+`LLM_MODEL` must match the server's own model name exactly. Make sure the
+server's context window fits the schema (at least 8k), or the schema is
+silently truncated:
+
+- **Ollama**: the default is small — start it with
+  `OLLAMA_CONTEXT_LENGTH=8192 ollama serve`. For several simultaneous users,
+  also set `OLLAMA_NUM_PARALLEL`.
+- **vLLM**: `vllm serve <model> --max-model-len 8192` (NVIDIA GPU on Linux).
+
+Hosted OpenAI-compatible APIs work the same way; set `LLM_API_KEY` to their
+key.
+
+To confirm which backend answered, check the backend log: `[openai] input=…`
+means the local/OpenAI-compatible server, `[generate_sql] cache_read=…` means
+Claude. An invalid `LLM_PROVIDER` or missing `LLM_MODEL` stops the backend at
+startup with an error.
+
+SQL generation asks the server for JSON matching a schema (`response_format:
+json_schema`), which LM Studio enforces; servers that reject it are retried
+without it, with the schema in the prompt instead. `<think>` blocks from reasoning
+models and stray code fences are stripped. Prompt caching and adaptive
+thinking are Claude-only features and are skipped. Expect lower SQL accuracy
+than Claude on complex schemas — the one automatic repair retry helps.
 
 ### Configure databases
 
